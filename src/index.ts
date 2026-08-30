@@ -11,11 +11,22 @@ dotenv.config();
 const app: Express = express();
 const server = http.createServer(app);
 const PORT = Number(process.env.PORT) || 3000;
+const allowedOrigins = (process.env.CLIENT_URLS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 setupWebSocketServer(server);
 
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true,
 }));
 app.use(express.json());

@@ -1,0 +1,110 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  HOST
+  PARTICIPANT
+}
+
+enum SubscriptionTier {
+  FREE
+  PRO
+}
+
+model User {
+  id           String           @id @default(uuid())
+  email        String           @unique
+  name         String
+  passwordHash String
+  isVerified   Boolean          @default(false)
+  avatarUrl    String?
+  tier         SubscriptionTier @default(FREE)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  // Relationships
+  ownedRooms         Room[]              @relation("RoomOwner")
+  joinedRooms        RoomMember[]
+  createdSnapshots   CanvasSnapshot[]
+  verificationTokens VerificationToken[]
+
+  @@map("users")
+}
+
+model VerificationToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([token])
+  @@map("verification_tokens")
+}
+
+model Room {
+  id        String   @id @default(uuid())
+  code      String   @unique // Short shareable code (e.g., "room-9f2b1a")
+  title     String   @default("Untitled Board")
+  isLocked  Boolean  @default(false)
+  maxPeers  Int      @default(4) // Mesh WebRTC peer limit
+  ownerId   String?
+  owner     User?    @relation("RoomOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relationships
+  board     Board?
+  members   RoomMember[]
+  snapshots CanvasSnapshot[]
+
+  @@index([code])
+  @@map("rooms")
+}
+
+model Board {
+  id         String   @id @default(uuid())
+  roomId     String   @unique
+  room       Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  canvasData Json     @default("[]") // Stores the latest serialized tldraw state
+  version    Int      @default(1)
+  updatedAt  DateTime @updatedAt
+
+  @@map("boards")
+}
+
+model CanvasSnapshot {
+  id          String   @id @default(uuid())
+  roomId      String
+  room        Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  canvasData  Json // Serialized state at the time of snapshot/export
+  label       String? // e.g., "Version 1.0 - Wireframe Completed"
+  createdById String?
+  createdBy   User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([roomId])
+  @@map("canvas_snapshots")
+}
+
+model RoomMember {
+  id       String   @id @default(uuid())
+  userId   String
+  roomId   String
+  role     Role     @default(PARTICIPANT)
+  joinedAt DateTime @default(now())
+
+  // Relationships
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roomId])
+  @@index([roomId])
+  @@map("room_members")
+}

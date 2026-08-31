@@ -1,6 +1,10 @@
-import nodemailer from 'nodemailer';
-import type Transporter from 'nodemailer/lib/mailer/index.js';
+import dns from 'node:dns';
+import nodemailer, { type Transporter } from 'nodemailer';
+import type SMTPTransport from 'nodemailer/lib/smtp-transport/index.js';
 import { getClientUrl } from './clientUrl.js';
+
+// Render and similar hosts often lack IPv6 routes to Gmail SMTP.
+dns.setDefaultResultOrder('ipv4first');
 
 let transporter: Transporter | null = null;
 
@@ -10,20 +14,26 @@ function emailConfigured(): boolean {
 
 function getTransporter(): Transporter {
   if (!transporter) {
+    const host = process.env.EMAIL_HOST;
+    const user = process.env.EMAIL_USER;
     const pass = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
 
-    transporter = nodemailer.createTransport({
-      host: process.env.EMAIL_HOST,
-      port: Number(process.env.EMAIL_PORT) || 587,
-      secure: Number(process.env.EMAIL_PORT) === 465,
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass,
-      },
+    if (!host || !user || !pass) {
+      throw new Error('Email is not configured');
+    }
+
+    const port = Number(process.env.EMAIL_PORT) || 587;
+    const options: SMTPTransport.Options = {
+      host,
+      port,
+      secure: port === 465,
+      auth: { user, pass },
       connectionTimeout: 10_000,
       greetingTimeout: 10_000,
       socketTimeout: 15_000,
-    });
+    };
+
+    transporter = nodemailer.createTransport(options);
   }
 
   return transporter;
@@ -48,6 +58,11 @@ function logDevLink(kind: string, link: string, email: string) {
   console.log(`[mail] ${kind} link for ${email}: ${link}`);
 }
 
+function logProdLinkOnFailure(kind: string, link: string, email: string) {
+  if (process.env.NODE_ENV !== 'production') return;
+  console.warn(`[mail] ${kind} delivery failed — manual link for ${email}: ${link}`);
+}
+
 async function sendMail(options: {
   to: string;
   subject: string;
@@ -65,15 +80,20 @@ async function sendMail(options: {
 
   logDevLink(kind, link, to);
 
-  const info = await getTransporter().sendMail({
-    from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
-    to,
-    subject,
-    html,
-    text,
-  });
+  try {
+    const info = await getTransporter().sendMail({
+      from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      html,
+      text,
+    });
 
-  console.log(`[mail] ${kind} sent to ${to} (messageId: ${info.messageId || 'n/a'})`);
+    console.log(`[mail] ${kind} sent to ${to} (messageId: ${info.messageId || 'n/a'})`);
+  } catch (error) {
+    logProdLinkOnFailure(kind, link, to);
+    throw error;
+  }
 }
 
 export async function sendVerificationEmail(email: string, token: string) {

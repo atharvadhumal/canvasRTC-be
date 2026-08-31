@@ -8,7 +8,19 @@ interface ClientConnection {
 }
 
 interface SignalingMessage {
-  type: 'JOIN_ROOM' | 'EXISTING_PEERS' | 'USER_JOINED' | 'SIGNAL_OFFER' | 'SIGNAL_ANSWER' | 'ICE_CANDIDATE' | 'USER_LEFT' | 'PING' | 'PONG';
+  type:
+    | 'JOIN_ROOM'
+    | 'EXISTING_PEERS'
+    | 'USER_JOINED'
+    | 'SIGNAL_OFFER'
+    | 'SIGNAL_ANSWER'
+    | 'ICE_CANDIDATE'
+    | 'USER_LEFT'
+    | 'PING'
+    | 'PONG'
+    | 'BOARD_SYNC'
+    | 'BOARD_SYNC_REQUEST'
+    | 'BOARD_SNAPSHOT';
   roomId: string;
   userId: string;
   targetId?: string;
@@ -16,6 +28,11 @@ interface SignalingMessage {
 }
 
 const rooms = new Map<string, Map<string, WebSocket>>();
+const boardSnapshots = new Map<string, unknown>();
+
+function roomClientsForBroadcast(roomId: string) {
+  return rooms.get(roomId) ?? new Map();
+}
 
 export function setupWebSocketServer(httpServer: HttpServer) {
   const wss = new WebSocketServer({ server: httpServer });
@@ -42,6 +59,18 @@ export function setupWebSocketServer(httpServer: HttpServer) {
             // Register current peer
             roomClients.set(userId, ws);
 
+            const snapshot = boardSnapshots.get(roomId);
+            if (snapshot) {
+              ws.send(
+                JSON.stringify({
+                  type: 'BOARD_SNAPSHOT',
+                  roomId,
+                  userId,
+                  payload: { snapshot },
+                })
+              );
+            }
+
             // Send existing peers to new arrival
             ws.send(
               JSON.stringify({
@@ -65,6 +94,42 @@ export function setupWebSocketServer(httpServer: HttpServer) {
                 );
               }
             });
+            break;
+          }
+
+          case 'BOARD_SYNC': {
+            if (!roomId || !payload?.diff) return;
+            const snapshot = payload.snapshot ?? payload.diff;
+            if (snapshot) {
+              boardSnapshots.set(roomId, snapshot);
+            }
+
+            roomClientsForBroadcast(roomId).forEach((peerWs, peerId) => {
+              if (peerId !== userId && peerWs.readyState === WebSocket.OPEN) {
+                peerWs.send(
+                  JSON.stringify({
+                    type: 'BOARD_SYNC',
+                    roomId,
+                    userId,
+                    payload: { diff: payload.diff, snapshot },
+                  })
+                );
+              }
+            });
+            break;
+          }
+
+          case 'BOARD_SYNC_REQUEST': {
+            const snapshot = boardSnapshots.get(roomId);
+            if (!snapshot) return;
+            ws.send(
+              JSON.stringify({
+                type: 'BOARD_SNAPSHOT',
+                roomId,
+                userId,
+                payload: { snapshot },
+              })
+            );
             break;
           }
 

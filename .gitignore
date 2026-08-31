@@ -9,6 +9,8 @@ node_modules/
 client/node_modules/
 server/node_modules/
 
+/dist
+
 # Build output
 client/dist/
 client/build/

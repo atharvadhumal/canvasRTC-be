@@ -1,81 +1,46 @@
-import dns from 'node:dns';
-import net from 'node:net';
-import nodemailer, { type Transporter } from 'nodemailer';
-import type SMTPTransport from 'nodemailer/lib/smtp-transport/index.js';
 import { getClientUrl } from './clientUrl.js';
 
-let transporterPromise: Promise<Transporter> | null = null;
+// Brevo's transactional endpoint is used instead of SMTP because most free
+// hosting tiers (Render included) block outbound ports 25/465/587.
+const BREVO_ENDPOINT = 'https://api.brevo.com/v3/smtp/email';
+const BREVO_ACCOUNT_ENDPOINT = 'https://api.brevo.com/v3/account';
+const REQUEST_TIMEOUT_MS = 15_000;
 
 function emailConfigured(): boolean {
-  return Boolean(process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASS);
+  return Boolean(process.env.BREVO_API_KEY && process.env.EMAIL_FROM);
 }
 
-async function resolveSmtpIpv4(hostname: string): Promise<{ host: string; servername: string }> {
-  if (net.isIP(hostname)) {
-    return { host: hostname, servername: hostname };
-  }
-
-  try {
-    const [ipv4] = await dns.promises.resolve4(hostname);
-    if (ipv4) {
-      return { host: ipv4, servername: hostname };
-    }
-  } catch (error) {
-    console.warn(`[mail] IPv4 DNS resolve failed for ${hostname}, using hostname directly`, error);
-  }
-
-  return { host: hostname, servername: hostname };
-}
-
-async function createTransporter(): Promise<Transporter> {
-  const smtpHost = process.env.EMAIL_HOST;
-  const user = process.env.EMAIL_USER;
-  const pass = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
-
-  if (!smtpHost || !user || !pass) {
-    throw new Error('Email is not configured');
-  }
-
-  const port = Number(process.env.EMAIL_PORT) || 587;
-  const { host, servername } = await resolveSmtpIpv4(smtpHost);
-
-  const options: SMTPTransport.Options = {
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass },
-    connectionTimeout: 10_000,
-    greetingTimeout: 10_000,
-    socketTimeout: 15_000,
-    tls: { servername },
+function getSender(): { name: string; email: string } {
+  return {
+    name: process.env.EMAIL_FROM_NAME || 'CanvasRTC',
+    email: process.env.EMAIL_FROM as string,
   };
-
-  if (host !== smtpHost) {
-    console.log(`[mail] SMTP will connect to ${host} (${smtpHost}) over IPv4`);
-  }
-
-  return nodemailer.createTransport(options);
-}
-
-async function getTransporter(): Promise<Transporter> {
-  if (!transporterPromise) {
-    transporterPromise = createTransporter();
-  }
-
-  return transporterPromise;
 }
 
 export async function verifyMailTransport(): Promise<void> {
   if (!emailConfigured()) {
-    console.warn('[mail] EMAIL_HOST, EMAIL_USER, or EMAIL_PASS is missing — verification emails will not send.');
+    console.warn('[mail] BREVO_API_KEY or EMAIL_FROM is missing — verification emails will not send.');
     return;
   }
 
   try {
-    await (await getTransporter()).verify();
-    console.log('[mail] SMTP connection verified');
+    const res = await fetch(BREVO_ACCOUNT_ENDPOINT, {
+      headers: {
+        accept: 'application/json',
+        'api-key': process.env.BREVO_API_KEY as string,
+      },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    if (!res.ok) {
+      console.error(`[mail] Brevo credentials rejected (HTTP ${res.status}): ${await res.text()}`);
+      return;
+    }
+
+    const account = (await res.json()) as { email?: string };
+    console.log(`[mail] Brevo API ready (account: ${account.email || 'unknown'}, sender: ${getSender().email})`);
   } catch (error) {
-    console.error('[mail] SMTP verification failed:', error);
+    console.error('[mail] Brevo verification failed:', error);
   }
 }
 
@@ -107,14 +72,28 @@ async function sendMail(options: {
   logDevLink(kind, link, to);
 
   try {
-    const info = await (await getTransporter()).sendMail({
-      from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
-      to,
-      subject,
-      html,
-      text,
+    const res = await fetch(BREVO_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'api-key': process.env.BREVO_API_KEY as string,
+      },
+      body: JSON.stringify({
+        sender: getSender(),
+        to: [{ email: to }],
+        subject,
+        htmlContent: html,
+        textContent: text,
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
+    if (!res.ok) {
+      throw new Error(`Brevo responded ${res.status}: ${await res.text()}`);
+    }
+
+    const info = (await res.json()) as { messageId?: string };
     console.log(`[mail] ${kind} sent to ${to} (messageId: ${info.messageId || 'n/a'})`);
   } catch (error) {
     logProdLinkOnFailure(kind, link, to);

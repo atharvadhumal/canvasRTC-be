@@ -3,6 +3,7 @@ import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import { prisma } from '../db.js';
+import { getClientUrl } from '../lib/clientUrl.js';
 import { signAccessToken } from '../lib/jwt.js';
 import { authenticateToken, type AuthRequest } from '../middleware/auth.middleware.js';
 
@@ -20,7 +21,7 @@ function avataaarsUrl(seed: string): string {
     size: '128',
     backgroundColor: 'b6e3f4,c0aede,d1d4f9,ffd5dc,ffdfbf',
   });
-  return `https://api.dicebear.com/9.x/avataaars/svg?${params.toString()}`;
+  return `https://api.dicebear.com/9.x/avataaars/png?${params.toString()}`;
 }
 
 function publicUser(user: {
@@ -51,11 +52,28 @@ const transporter = nodemailer.createTransport({
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
+  connectionTimeout: 10_000,
+  greetingTimeout: 10_000,
+  socketTimeout: 15_000,
 });
 
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
 async function sendVerificationEmail(email: string, token: string) {
-  const verifyLink = `${process.env.CLIENT_URL}/verify-email?token=${token}`;
-  
+  const clientUrl = getClientUrl();
+  const verifyLink = `${clientUrl}/verify-email?token=${token}`;
+
+  if (!process.env.EMAIL_HOST || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.warn('Email is not configured. Verification link:', verifyLink);
+    return;
+  }
+
   await transporter.sendMail({
     from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
     to: email,
@@ -72,8 +90,13 @@ async function sendVerificationEmail(email: string, token: string) {
 }
 
 async function sendPasswordResetEmail(email: string, token: string) {
-  const resetLink = `${process.env.CLIENT_URL}/reset-password?token=${token}`;
-  
+  const resetLink = `${getClientUrl()}/reset-password?token=${token}`;
+
+  if (!process.env.EMAIL_HOST || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.warn('Email is not configured. Password reset link:', resetLink);
+    return;
+  }
+
   await transporter.sendMail({
     from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
     to: email,
@@ -92,9 +115,22 @@ async function sendPasswordResetEmail(email: string, token: string) {
 // 1. REGISTER
 router.post('/register', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { name, email, password } = req.body;
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const email = typeof req.body?.email === 'string' ? normalizeEmail(req.body.email) : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
     if (!name || !email || !password) {
       res.status(400).json({ error: 'All fields are required' });
+      return;
+    }
+
+    if (!isValidEmail(email)) {
+      res.status(400).json({ error: 'Enter a valid email address' });
+      return;
+    }
+
+    if (password.length < 8) {
+      res.status(400).json({ error: 'Password must be at least 8 characters' });
       return;
     }
 
@@ -107,7 +143,7 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({
       data: {
-        name: String(name).trim(),
+        name,
         email,
         passwordHash,
         isVerified: false,
@@ -131,11 +167,13 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
       },
     });
 
-    await sendVerificationEmail(email, token);
-
     res.status(201).json({
       message: 'Registration successful. Please verify your email.',
       setupToken,
+    });
+
+    void sendVerificationEmail(email, token).catch((err: unknown) => {
+      console.error('Failed to send verification email:', err);
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -186,7 +224,7 @@ router.post('/setup-avatar', async (req: Request, res: Response): Promise<void> 
 // 2. VERIFY EMAIL
 router.post('/verify-email', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { token } = req.body;
+    const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
     if (!token) {
       res.status(400).json({ error: 'Verification token is required' });
       return;
@@ -194,10 +232,17 @@ router.post('/verify-email', async (req: Request, res: Response): Promise<void> 
 
     const tokenRecord = await prisma.verificationToken.findUnique({
       where: { token },
+      include: { user: true },
     });
 
     if (!tokenRecord || tokenRecord.expiresAt < new Date()) {
       res.status(400).json({ error: 'Invalid or expired verification link' });
+      return;
+    }
+
+    if (tokenRecord.user.isVerified) {
+      await prisma.verificationToken.delete({ where: { id: tokenRecord.id } });
+      res.json({ message: 'Email already verified!' });
       return;
     }
 
@@ -217,10 +262,50 @@ router.post('/verify-email', async (req: Request, res: Response): Promise<void> 
   }
 });
 
+router.post('/resend-verification', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const email = typeof req.body?.email === 'string' ? normalizeEmail(req.body.email) : '';
+    if (!email || !isValidEmail(email)) {
+      res.status(400).json({ error: 'A valid email address is required' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user || user.isVerified) {
+      res.json({ message: 'If your account needs verification, a new link has been sent.' });
+      return;
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    await prisma.verificationToken.create({
+      data: { token, userId: user.id, expiresAt },
+    });
+
+    res.json({ message: 'If your account needs verification, a new link has been sent.' });
+
+    void sendVerificationEmail(email, token).catch((err: unknown) => {
+      console.error('Failed to resend verification email:', err);
+    });
+  } catch (error) {
+    console.error('Resend verification error:', error);
+    res.status(500).json({ error: 'Failed to resend verification email' });
+  }
+});
+
 // 3. LOGIN
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password } = req.body;
+    const email = typeof req.body?.email === 'string' ? normalizeEmail(req.body.email) : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    if (!email || !password) {
+      res.status(400).json({ error: 'Email and password are required' });
+      return;
+    }
+
     const user = await prisma.user.findUnique({ where: { email } });
 
     if (!user) {
@@ -332,7 +417,7 @@ router.patch('/me', authenticateToken, async (req: AuthRequest, res: Response): 
 // 5. FORGOT PASSWORD (Request Reset Link)
 router.post('/forgot-password', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email } = req.body;
+    const email = typeof req.body?.email === 'string' ? normalizeEmail(req.body.email) : '';
     if (!email) {
       res.status(400).json({ error: 'Email is required' });
       return;
@@ -359,8 +444,11 @@ router.post('/forgot-password', async (req: Request, res: Response): Promise<voi
       },
     });
 
-    await sendPasswordResetEmail(email, token);
     res.json({ message: 'If an account exists, a reset link has been sent.' });
+
+    void sendPasswordResetEmail(email, token).catch((err: unknown) => {
+      console.error('Failed to send password reset email:', err);
+    });
   } catch (error) {
     console.error('Forgot password error:', error);
     res.status(500).json({ error: 'Failed to process request' });

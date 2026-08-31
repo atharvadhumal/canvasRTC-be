@@ -1,10 +1,9 @@
 import { Router, type Request, type Response } from 'express';
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
-import nodemailer from 'nodemailer';
 import { prisma } from '../db.js';
-import { getClientUrl } from '../lib/clientUrl.js';
 import { signAccessToken } from '../lib/jwt.js';
+import { sendPasswordResetEmail, sendVerificationEmail } from '../lib/mail.js';
 import { authenticateToken, type AuthRequest } from '../middleware/auth.middleware.js';
 
 const router = Router();
@@ -44,72 +43,12 @@ function isAllowedAvatarUrl(url: string): boolean {
   return ALLOWED_AVATAR_PREFIXES.some((prefix) => url.startsWith(prefix));
 }
 
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST,
-  port: Number(process.env.EMAIL_PORT) || 587,
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-  connectionTimeout: 10_000,
-  greetingTimeout: 10_000,
-  socketTimeout: 15_000,
-});
-
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
 function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-async function sendVerificationEmail(email: string, token: string) {
-  const clientUrl = getClientUrl();
-  const verifyLink = `${clientUrl}/verify-email?token=${token}`;
-
-  if (!process.env.EMAIL_HOST || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    console.warn('Email is not configured. Verification link:', verifyLink);
-    return;
-  }
-
-  await transporter.sendMail({
-    from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
-    to: email,
-    subject: 'Verify your CanvasRTC Account',
-    html: `
-      <div style="font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
-        <h2 style="color: #4f46e5;">Welcome to CanvasRTC!</h2>
-        <p style="color: #475569;">Please verify your email address to activate your account and start collaborating.</p>
-        <a href="${verifyLink}" style="display:inline-block; padding: 10px 20px; background-color: #4f46e5; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 16px 0;">Verify Email Address</a>
-        <p style="color: #94a3b8; font-size: 12px;">This link will expire in 24 hours.</p>
-      </div>
-    `,
-  });
-}
-
-async function sendPasswordResetEmail(email: string, token: string) {
-  const resetLink = `${getClientUrl()}/reset-password?token=${token}`;
-
-  if (!process.env.EMAIL_HOST || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    console.warn('Email is not configured. Password reset link:', resetLink);
-    return;
-  }
-
-  await transporter.sendMail({
-    from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
-    to: email,
-    subject: 'Reset your CanvasRTC Password',
-    html: `
-      <div style="font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
-        <h2 style="color: #7c3aed;">Reset Your Password</h2>
-        <p style="color: #475569;">You requested a password reset. Click the link below to set a new password:</p>
-        <a href="${resetLink}" style="display:inline-block; padding: 10px 20px; background-color: #7c3aed; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 16px 0;">Reset Password</a>
-        <p style="color: #94a3b8; font-size: 12px;">This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>
-      </div>
-    `,
-  });
 }
 
 // 1. REGISTER

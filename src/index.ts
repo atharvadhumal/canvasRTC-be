@@ -7,6 +7,7 @@ import roomRoutes from './routes/rooms.routes.ts';
 import { authenticateToken } from './middleware/auth.middleware.js';
 import { setupWebSocketServer } from './wsHandler.js';
 import { getJwtSecret } from './lib/jwt.js';
+import { verifyMailTransport } from './lib/mail.js';
 
 dotenv.config();
 getJwtSecret();
@@ -71,4 +72,5 @@ app.get('/api/ice-config', authenticateToken, (_req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Server is running on ${PORT}`);
+  void verifyMailTransport();
 });

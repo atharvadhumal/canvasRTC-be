@@ -1,42 +1,68 @@
 import dns from 'node:dns';
+import net from 'node:net';
 import nodemailer, { type Transporter } from 'nodemailer';
 import type SMTPTransport from 'nodemailer/lib/smtp-transport/index.js';
 import { getClientUrl } from './clientUrl.js';
 
-// Render and similar hosts often lack IPv6 routes to Gmail SMTP.
-dns.setDefaultResultOrder('ipv4first');
-
-let transporter: Transporter | null = null;
+let transporterPromise: Promise<Transporter> | null = null;
 
 function emailConfigured(): boolean {
   return Boolean(process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASS);
 }
 
-function getTransporter(): Transporter {
-  if (!transporter) {
-    const host = process.env.EMAIL_HOST;
-    const user = process.env.EMAIL_USER;
-    const pass = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
-
-    if (!host || !user || !pass) {
-      throw new Error('Email is not configured');
-    }
-
-    const port = Number(process.env.EMAIL_PORT) || 587;
-    const options: SMTPTransport.Options = {
-      host,
-      port,
-      secure: port === 465,
-      auth: { user, pass },
-      connectionTimeout: 10_000,
-      greetingTimeout: 10_000,
-      socketTimeout: 15_000,
-    };
-
-    transporter = nodemailer.createTransport(options);
+async function resolveSmtpIpv4(hostname: string): Promise<{ host: string; servername: string }> {
+  if (net.isIP(hostname)) {
+    return { host: hostname, servername: hostname };
   }
 
-  return transporter;
+  try {
+    const [ipv4] = await dns.promises.resolve4(hostname);
+    if (ipv4) {
+      return { host: ipv4, servername: hostname };
+    }
+  } catch (error) {
+    console.warn(`[mail] IPv4 DNS resolve failed for ${hostname}, using hostname directly`, error);
+  }
+
+  return { host: hostname, servername: hostname };
+}
+
+async function createTransporter(): Promise<Transporter> {
+  const smtpHost = process.env.EMAIL_HOST;
+  const user = process.env.EMAIL_USER;
+  const pass = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
+
+  if (!smtpHost || !user || !pass) {
+    throw new Error('Email is not configured');
+  }
+
+  const port = Number(process.env.EMAIL_PORT) || 587;
+  const { host, servername } = await resolveSmtpIpv4(smtpHost);
+
+  const options: SMTPTransport.Options = {
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass },
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
+    tls: { servername },
+  };
+
+  if (host !== smtpHost) {
+    console.log(`[mail] SMTP will connect to ${host} (${smtpHost}) over IPv4`);
+  }
+
+  return nodemailer.createTransport(options);
+}
+
+async function getTransporter(): Promise<Transporter> {
+  if (!transporterPromise) {
+    transporterPromise = createTransporter();
+  }
+
+  return transporterPromise;
 }
 
 export async function verifyMailTransport(): Promise<void> {
@@ -46,7 +72,7 @@ export async function verifyMailTransport(): Promise<void> {
   }
 
   try {
-    await getTransporter().verify();
+    await (await getTransporter()).verify();
     console.log('[mail] SMTP connection verified');
   } catch (error) {
     console.error('[mail] SMTP verification failed:', error);
@@ -81,7 +107,7 @@ async function sendMail(options: {
   logDevLink(kind, link, to);
 
   try {
-    const info = await getTransporter().sendMail({
+    const info = await (await getTransporter()).sendMail({
       from: `"CanvasRTC" <${process.env.EMAIL_USER}>`,
       to,
       subject,

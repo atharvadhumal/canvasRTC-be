@@ -73,6 +73,7 @@ model Board {
   roomId     String   @unique
   room       Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
   canvasData Json     @default("[]") // Stores the latest serialized tldraw state
+  thumbnail  String?  // JPEG data URL for dashboard previews
   version    Int      @default(1)
   updatedAt  DateTime @updatedAt
 

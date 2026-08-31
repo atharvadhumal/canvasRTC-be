@@ -1,13 +1,47 @@
 import { Router, type Request, type Response } from 'express';
 import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
-import { prisma } from '../db.ts';
-
-import { authenticateToken, type AuthRequest } from '../middleware/auth.middleware.ts';
+import { prisma } from '../db.js';
+import { signAccessToken } from '../lib/jwt.js';
+import { authenticateToken, type AuthRequest } from '../middleware/auth.middleware.js';
 
 const router = Router();
+
+const ALLOWED_AVATAR_PREFIXES = [
+  'https://api.dicebear.com/9.x/avataaars/',
+  'https://api.dicebear.com/8.x/avataaars/',
+  'https://avataaars.io/',
+];
+
+function avataaarsUrl(seed: string): string {
+  const params = new URLSearchParams({
+    seed,
+    size: '128',
+    backgroundColor: 'b6e3f4,c0aede,d1d4f9,ffd5dc,ffdfbf',
+  });
+  return `https://api.dicebear.com/9.x/avataaars/svg?${params.toString()}`;
+}
+
+function publicUser(user: {
+  id: string;
+  name: string;
+  email: string;
+  tier: string;
+  avatarUrl?: string | null;
+}) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    tier: user.tier,
+    avatarUrl: user.avatarUrl || avataaarsUrl(user.email),
+  };
+}
+
+function isAllowedAvatarUrl(url: string): boolean {
+  return ALLOWED_AVATAR_PREFIXES.some((prefix) => url.startsWith(prefix));
+}
 
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
@@ -72,7 +106,13 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({
-      data: { name, email, passwordHash, isVerified: false },
+      data: {
+        name: String(name).trim(),
+        email,
+        passwordHash,
+        isVerified: false,
+        avatarUrl: avataaarsUrl(email),
+      },
     });
 
     const token = crypto.randomBytes(32).toString('hex');
@@ -82,27 +122,64 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
       data: { token, userId: user.id, expiresAt },
     });
 
-    await sendVerificationEmail(email, token);
+    const setupToken = crypto.randomBytes(32).toString('hex');
+    await prisma.verificationToken.create({
+      data: {
+        token: setupToken,
+        userId: user.id,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      },
+    });
 
-    const authToken = jwt.sign(
-      { userId: user.id, email: user.email },
-      process.env.JWT_SECRET || 'a6b99f3b455f83a7c22a7d15adfc9c4676ba1a09fcc79b3cff78a9ba84de6efc',
-      { expiresIn: '7d' }
-    );
+    await sendVerificationEmail(email, token);
 
     res.status(201).json({
       message: 'Registration successful. Please verify your email.',
-      token: authToken,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        tier: user.tier,
-      },
+      setupToken,
     });
   } catch (error) {
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Internal server error during registration' });
+  }
+});
+
+router.post('/setup-avatar', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const token = typeof req.body?.token === 'string' ? req.body.token : '';
+    const avatarUrl = typeof req.body?.avatarUrl === 'string' ? req.body.avatarUrl.trim() : '';
+
+    if (!token || !avatarUrl) {
+      res.status(400).json({ error: 'Avatar and setup token are required' });
+      return;
+    }
+
+    if (!isAllowedAvatarUrl(avatarUrl) || avatarUrl.length > 500) {
+      res.status(400).json({ error: 'Choose a valid Avataaars avatar' });
+      return;
+    }
+
+    const tokenRecord = await prisma.verificationToken.findUnique({
+      where: { token },
+    });
+
+    if (!tokenRecord || tokenRecord.expiresAt < new Date()) {
+      res.status(400).json({ error: 'Avatar setup expired. You can change it later in Settings.' });
+      return;
+    }
+
+    await prisma.user.update({
+      where: { id: tokenRecord.userId },
+      data: { avatarUrl },
+    });
+
+    await prisma.verificationToken.delete({
+      where: { id: tokenRecord.id },
+    });
+
+    res.json({ message: 'Avatar saved' });
+  } catch (error) {
+    console.error('Setup avatar error:', error);
+    res.status(500).json({ error: 'Failed to save avatar' });
   }
 });
 
@@ -162,20 +239,23 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const token = jwt.sign(
-      { userId: user.id, email: user.email },
-      process.env.JWT_SECRET || 'a6b99f3b455f83a7c22a7d15adfc9c4676ba1a09fcc79b3cff78a9ba84de6efc',
-      { expiresIn: '7d' }
-    );
+    if (!user.avatarUrl) {
+      const avatarUrl = avataaarsUrl(user.email);
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { avatarUrl },
+      });
+      user.avatarUrl = avatarUrl;
+    }
+
+    const token = signAccessToken({
+      userId: user.id,
+      email: user.email,
+    });
 
     res.json({
       token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        tier: user.tier,
-      },
+      user: publicUser(user),
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -192,6 +272,7 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response): Pr
         name: true,
         email: true,
         tier: true,
+        avatarUrl: true,
         createdAt: true,
       },
     });
@@ -201,10 +282,50 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response): Pr
       return;
     }
 
-    res.json({ user });
+    res.json({ user: publicUser(user) });
   } catch (error) {
     console.error('Fetch profile error:', error);
     res.status(500).json({ error: 'Failed to fetch profile' });
+  }
+});
+
+router.patch('/me', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const avatarUrl = typeof req.body?.avatarUrl === 'string' ? req.body.avatarUrl.trim() : '';
+
+    if (!name || name.length > 60) {
+      res.status(400).json({ error: 'Name must be between 1 and 60 characters' });
+      return;
+    }
+
+    if (!avatarUrl || avatarUrl.length > 500 || !isAllowedAvatarUrl(avatarUrl)) {
+      res.status(400).json({ error: 'Choose a valid Avataaars avatar' });
+      return;
+    }
+
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { name, avatarUrl },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        tier: true,
+        avatarUrl: true,
+      },
+    });
+
+    res.json({ user: publicUser(user) });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
   }
 });
 
